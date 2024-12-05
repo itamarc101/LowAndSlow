@@ -546,26 +546,38 @@ def copy_and_rename_files_in_folder(folder_path, new_name_prefix):
     except Exception as e:
         print(f"An error occurred: {e}")
 
-
 def split_streams(input_pcap):
 
     # Output directory
-    output_dir = f'split_streams {input_pcap}'
+    output_dir =  f'split_streams {input_pcap}'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Get unique HTTP/2 stream IDs
-    stream_ids = subprocess.check_output(
-        ["tshark", "-r", input_pcap, "-Y", "http2", "-T", "fields", "-e", "http2.streamid"]
-    ).decode().splitlines()
-    stream_ids = sorted(set(stream_ids))
+    # Get unique HTTP/2 stream IDs from the PCAP
+    try:
+        stream_ids = subprocess.check_output(
+            ["tshark", "-r", input_pcap, "-Y", "http2", "-T", "fields", "-e", "tcp.stream"]
+        ).decode().splitlines()
 
-    # Extract each stream
+        # Remove duplicates and sort the stream IDs
+        stream_ids = sorted(set(stream_ids))
+        print(f"Found {len(stream_ids)} HTTP/2 streams.")
+    except subprocess.CalledProcessError as e:
+        print(f"Error while extracting HTTP/2 stream IDs: {e}")
+        exit(1)
+
+    # Extract each stream into a separate PCAP file
     for stream_id in stream_ids:
-        output_pcap = os.path.join(output_dir, f"http2stream{stream_id}.pcap")
-        print(f"Extracting stream ID {stream_id} to {output_pcap}")
-        subprocess.run(
-            ["tshark", "-r", input_pcap, "-Y", f"http2.streamid == {stream_id}", "-w", output_pcap]
-        )
+        if stream_id.strip():  # Ensure the stream_id is not empty
+            output_pcap = os.path.join(output_dir, f"http2stream{stream_id}.pcap")
+            print(f"Extracting stream ID {stream_id} to {output_pcap}")
+            try:
+                subprocess.run(
+                    ["tshark", "-r", input_pcap, "-Y", f"tcp.stream == {stream_id}", "-w", output_pcap],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                print(f"Error while extracting stream ID {stream_id}: {e}")
+
     return copy_and_rename_files_in_folder(f'/home/dvir/PycharmProjects/FinalProj/{output_dir}', input_pcap)
 
 def main_run(input_pcap, func=1, t=0.0):
