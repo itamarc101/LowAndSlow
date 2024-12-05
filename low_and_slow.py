@@ -5,6 +5,8 @@ from collections import defaultdict
 import copy
 import os
 import ast
+import subprocess
+
 
 PCAP = 'Google-Chrome.pcap'
 flow_dict = {}  # Maps flow identifiers to consolidated event sequences
