@@ -21,6 +21,7 @@ pair_count = []
 incomplete_frame = {}  # Handles partial frames
 SERVER_PORT = 80
 seq_de = ""
+detect_count = 0
 lookahead_pairs = defaultdict(list)  # to store the lookahead pairs
 
 from scapy.layers.inet import IP, TCP
@@ -169,29 +170,29 @@ def detection_phase(Dlookahead, Ddelay, n, t, packets, pcap_name):
         for i in range(1,len_events-1):
             twoevent = f'{newevents[i-1]}{newevents[i]}'
 
-            write_to_file("DelaysDetect", twoevent)
+            write_to_file("DelaysDetect", twoevent, 'a')
             if twoevent in Ddelay:
                 max_delay = Ddelay[twoevent] # Check the last event's maximum delay
                 if(max_delay != 0):
                 # Check time difference from the last event timing
                     last_event_time = events_time[-1] - events_time[-2]
                     if last_event_time  > max_delay:
-                        write_to_file(f'DelaysDetect_{pcap_name}', f'Attack: Delayyyyy", {twoevent}, " - {max}: ", {max_delay},"<", {last_event_time}')
+                        write_to_file(f'DelaysDetect_{pcap_name}', f'Attack: Delayyyyy", {twoevent}, " - {max}: ", {max_delay},"<", {last_event_time}', 'a')
                         # print("Attack: Delayyyyy", twoevent, " - max: ", max_delay,"<", last_event_time)
                         delay_counter += 1
                         # return True
-    write_to_file(f'DelaysDetect_{pcap_name}', f'Found {delay_counter} delays')
+    write_to_file(f'DelaysDetect_{pcap_name}', f'Found {delay_counter} delays' ,'a')
     # print(f'Found {delay_counter} delays')
     # return False
 
-def write_to_file(file_name, text_to_append):
+def write_to_file(file_name, text_to_append, mode):
     try:
-        with open(file_name, 'a') as file:  # 'a' mode creates the file if it doesn't exist and appends text
+        with open(file_name, mode) as file:  # 'a' mode creates the file if it doesn't exist and appends text
             file.write(text_to_append + '\n')  # Add a newline after the text
     except Exception as e:
         print(f"An error occurred: {e}")
 def detection_phase_mismatch(Dlookahead, Ddelay, n, t, packets, pcap_name):
-    global seq_de
+    global seq_de, detect_count
     events = []
     i = 0
 
@@ -212,7 +213,7 @@ def detection_phase_mismatch(Dlookahead, Ddelay, n, t, packets, pcap_name):
 
     if last_event_time and (time.time() - last_event_time) > max_delay:
         seq_de += f' → TO{i} → *'
-        print(f'Delayyyyy')
+        write_to_file(f'DetectMissmatch_{pcap_name}', f'Delayyyyy - {last_event}', 'a')
         i += 1
 
     mismatch = 0
@@ -221,13 +222,15 @@ def detection_phase_mismatch(Dlookahead, Ddelay, n, t, packets, pcap_name):
         for pair in lookahead_pairs:
             if pair not in Dlookahead:
                 mismatch += 1
-                print("added1tomismatch")
+                write_to_file(f'DetectMissmatch_{pcap_name}', "added1tomismatch", 'a')
 
     mismatch_ratio = mismatch / (n * (len(events) - (n + 1) / 2))
     if mismatch_ratio > t:
-        print("Sequence is anomalous")
+        write_to_file(f'DetectMissmatch_{pcap_name}', "Sequence is anomalous", 'a')
+        detect_count += 1
     elif mismatch_ratio < t and events[-1] == '->Goaway->*':
-        print("Sequence is normal")
+
+        write_to_file(f'DetectMissmatch_{pcap_name}', "Sequence is normal", 'a')
     # else:
     #     print(events[-1])
     #     print(n * (len(events) - (n + 1) / 2))
@@ -549,9 +552,15 @@ def copy_and_rename_files_in_folder(folder_path, new_name_prefix):
         print(f"An error occurred: {e}")
 
 def split_streams(input_pcap):
-
     # Output directory
     output_dir =  f'split_streams {input_pcap}'
+    folder_dest = f'/home/dvir/PycharmProjects/FinalProj/{input_pcap}_streams'
+    if os.path.isdir(output_dir) or os.path.isdir(folder_dest):
+        if os.path.isdir(folder_dest):
+            return len([f for f in os.listdir(folder_dest) if os.path.isfile(os.path.join(folder_dest, f))]), folder_dest
+        else:
+            return copy_and_rename_files_in_folder(folder_dest, input_pcap)
+
     os.makedirs(output_dir, exist_ok=True)
 
     # Get unique HTTP/2 stream IDs from the PCAP
@@ -583,7 +592,7 @@ def split_streams(input_pcap):
     return copy_and_rename_files_in_folder(f'/home/dvir/PycharmProjects/FinalProj/{output_dir}', input_pcap)
 
 def main_run(input_pcap, func=1, t=0.0):
-    global seq_de
+    global seq_de, detect_count
     Dlookahead = {}
     Ddelay = {}
     sum_packet = 0
@@ -601,6 +610,8 @@ def main_run(input_pcap, func=1, t=0.0):
         export_dict_to_file(Ddelay, "Ddelay.txt")
     elif func == 2:
         seq_de = ""
+        if os.path.isfile(f'DetectMissmatch_{input_pcap}'):
+            write_to_file(f'DetectMissmatch_{input_pcap}', "", 'w')
         Dlookahead = import_dict_from_file("Dlookahead.txt")
         Ddelay = import_dict_from_file("Ddelay.txt")
         # for i in range(1, count + 1):
@@ -609,14 +620,20 @@ def main_run(input_pcap, func=1, t=0.0):
         detection_phase(Dlookahead, Ddelay, window_size, t, packets, input_pcap)
 
     elif func == 3:
+        if os.path.isfile(f'DetectMissmatch_{input_pcap}'):
+            write_to_file(f'DetectMissmatch_{input_pcap}', "", 'w')
         count, dest_folder = split_streams(input_pcap)
         seq_de = ""
+        detect_count = 0
         Dlookahead = import_dict_from_file("Dlookahead.txt")
         Ddelay = import_dict_from_file("Ddelay.txt")
         for i in range(1, count + 1):
-            print(f"Open dataset{i}.pcap")
+            print(f"Open {input_pcap}{i}.pcap")
             packets = readPackets(f'{dest_folder}/{input_pcap}{i}.pcap')
-            detection_phase_mismatch(Dlookahead, Ddelay, window_size, t, packets, input_pcap)
+            count = detection_phase_mismatch(Dlookahead, Ddelay, window_size, t, packets, input_pcap)
+
+        write_to_file(f'DetectMissmatch_{input_pcap}', f'detect {detect_count} anomalous', 'a')
+
 
 if __name__ == '__main__':
 
