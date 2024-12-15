@@ -1,6 +1,7 @@
 
 # **Low-and-Slow HTTP/2 Attack Detection Tool**
 
+## **Description**
 Low-and-slow attacks on HTTP/2 are a form of Denial-of-Service (DoS) attacks that exploit the protocol's features to evade detection. These attacks operate by sending minimal amounts of data at a slow rate across multiple connections, making them difficult to identify using traditional traffic monitoring techniques.
 
 We present Low-and-Slow HTTP/2 Attack Detection Tool, a practical and comprehensive approach to detect such attacks in HTTP/2 traffic. Unlike conventional methods, this tool integrates event-sequence learning and delay analysis to identify anomalous behaviors that indicate the presence of slow-rate attacks. The tool operates in three distinct phases:
@@ -14,8 +15,6 @@ Experimental evaluations demonstrate the effectiveness of the tool in detecting 
 
 ## **Overview**
 This project provides a script to analyze HTTP/2 traffic, detecting **low-and-slow attacks**. It uses **event learning** and **delay analysis** techniques to identify anomalous behaviors in the traffic flow.
-
-## **Description**
 
 
 ## **Features**
