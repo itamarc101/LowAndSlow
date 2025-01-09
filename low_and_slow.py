@@ -1,35 +1,13 @@
-
-"""
-Filename: low_and_slow.py
-
-Description:
-This script processes PCAP files to analyze HTTP/2 traffic for low-and-slow attacks. It includes functions
-for learning event sequences, calculating delays, and detecting anomalies.
-
-Functions:
-- main_run: Entry point to run the processing and detection phases.
-- split_streams: Splits streams in a PCAP file.
-- readPackets: Reads packets from a PCAP file.
-- learning_phase: Analyzes packets to learn sequences and delays.
-- detection_phase: Detects anomalies based on learned sequences and delays.
-- detection_phase_mismatch: Detects mismatches between observed and learned sequences.
-- ... (other utility functions).
-
-Usage:
-    python low_and_slow.py [window_size]
-
-Dependencies:
-- scapy
-- tshark
-"""
-
+import pyshark
 from scapy.all import *
 from scapy.contrib.http2 import *
 from collections import defaultdict
+import copy
 import os
 import ast
 import subprocess
-
+import matplotlib.pyplot as plt
+import numpy as np
 
 PCAP = 'Google-Chrome.pcap'
 flow_dict = {}  # Maps flow identifiers to consolidated event sequences
@@ -45,239 +23,244 @@ incomplete_frame = {}  # Handles partial frames
 SERVER_PORT = 80
 seq_de = ""
 detect_count = 0
+lookahead_pairs = defaultdict(list)  # to store the lookahead pairs
 
 from scapy.layers.inet import IP, TCP
 
-def extractLookaheadPairs(seq, win_size):
-    """
-        Extracts lookahead pairs from a given sequence based on a specified window size.
-        Args:
-            seq (str): representing a sequence of events, separated by '->*'.
-            win_size (int): lookahead window size for extracting pairs.
 
-        Returns:
-            dict: A dictionary where each event maps to a list of lookahead pairs.
-                  Each pair consists of an event and its distance from the current event.
-        """
-    lookahead_pair = [] # Empty list to temp store lookahead pairs
-    count = 0 # Counter to keep track of total number of pairs
-    event_list = seq.split('->*') # Split the input sequence to list of events
+def extractLookaheadPairs(seq, window_size):
+    unique_event_sequences = []
+    pair_count = []
+    l = []
+    count = 0
+    event_list = seq.split('->*')
+    # print(f' event_list: {event_list}')
 
-    current_index = 0 # position of current event (event_list[index])
-    while current_index + 1 < len(event_list):
-        lookahead_distance = 1 # Lookahead distance for current event
-        lookahead_index = current_index + 1 # Start checking from next event
-
-        # Continue adding lookahead pairs within the window size
-        while lookahead_index <= current_index + int(win_size):
-            # Stop if reaches end of event list
-            if lookahead_index == len(event_list):  # When the cursor reaches end of the sequence
+    i = 0
+    while i + 1 < len(event_list):
+        k = 1
+        j = i + 1
+        while j <= i + int(window_size):
+            if j == len(event_list):  # When the cursor reaches end of the sequence
                 break
-            # Add lookahead event and distance to temp list
-            lookahead_pair.append(event_list[lookahead_index])
-            lookahead_pair.append(lookahead_distance)
-
-            # Check if lookahead pair is not in the dict for current event
-            if lookahead_pair not in lookahead_pairs[event_list[current_index]]:
-                temp = lookahead_pair.copy() # copy of temp list to avoid issues
-
-                # Append new lookahead pair for the current event
-                lookahead_pairs[event_list[current_index]].append(temp)
-                count += 1 # Inc lookahead pair count
-
-            lookahead_pair.clear() # Clear temp list for the next pair
-            lookahead_index += 1 # Next lookahead event
-            lookahead_distance += 1 # Next distance
-
-        current_index += 1 # Next event in sequence
-
-    pair_count.append(count) #Append total count of pairs to list
-
-    # Sum up all lookahead pairs
+            l.append(event_list[j])
+            l.append(k)
+            if l not in lookahead_pairs[event_list[i]]:
+                temp = l.copy()
+                lookahead_pairs[event_list[i]].append(temp)
+                count += 1
+            l.clear()
+            j += 1
+            k += 1
+        i += 1
+    pair_count.append(count)
     for item in lookahead_pairs:
         count += len(lookahead_pairs[item])
-
+    end = time.time()
+    # print('Execution Time: %s seconds' % (end - begin))
+    # print('Total pairs processed: %s' % count)
     return lookahead_pairs
 
 
-def learning_phase(Dlookahead, Ddelay, F, n):
-    """
-        process frames and extract lookahead pairs, delays, and event sequences for analysis.
-
-        Args:
-            Dlookahead (dict): store lookahead pairs.
-            Ddelay (dict): store delays between consecutive events.
-            F (list): A list of frames, where each frame is a dictionary containing
-                      'flowID', 'data', and 'time' keys.
-            n (int): lookahead window size.
-
-        Returns:
-            tuple: Updated Dlookahead, Ddelay, and the total number of packets processed.
-        """
+def learning_phase_2LOOPS(Dlookahead, Ddelay, F, n):
     global lookahead_pairs, incomplete_frame
 
-    events_timestamp = [] # List to store timestamp of events
-    event_sequence = 'Start->*' #Start of the sequence
+    # Extract lookahead pairs for the given window size
+    events_time = []
+    events_time.append(F[0]['time'])
 
-    # Append timestamp of first frame
-    events_timestamp.append(F[0]['time'])
+    pkt_count = 1  # Initialize packet count if needed for tracking within the flow
+    for flow in F:
+        seq = 'Start → ∗'  # Initialize sequence with 'Start'
+        for frame in flow:
+            if isinstance(frame, dict):  # Ensure the frame is a dictionary
+                flowID, current_frame, pkt_time = frame['flowID'], frame['data'], frame['time']
+                event = findEvent(flowID, current_frame, None, pkt_time, pkt_count)
+                if event is not None:
+                    with open('FrameToEvent.txt', 'a') as f:
+                        f.write('%s=%s' % (current_frame, event))
+                        f.write('\n')
+                    events_time.append(pkt_time)
+                    seq += f'{event}'
+                    pkt_count += 1
+        lookahead_pairs = extractLookaheadPairs(seq, n)
 
-    packt_count = 1
+        Dlookahead.update(lookahead_pairs)
+        events = seq.split('->*')
+
+        i = 1
+        while i < pkt_count:
+            delay = events_time[i] - events_time[i - 1]
+            str = f'{events[i - 1]}{events[i]}'
+            if str not in Ddelay:
+                Ddelay[str] = delay
+            else:
+                Ddelay[str] = max(delay, Ddelay[str])
+            i += 1
+
+        export_dict_to_file(Dlookahead, "Dlookahead.txt")
+        export_dict_to_file(Ddelay, "Ddelay.txt")
+
+
+def learning_phase(Dlookahead, Ddelay, F, n):
+    global lookahead_pairs, incomplete_frame
+
+    events_time = []
+    seq = 'Start->*'
+
+    events_time.append(F[0]['time'])
+
+    pkt_count = 1
     for frame in F:
-        # check if frame is a valid dictionary
         if isinstance(frame, dict):
-            # Get the details
-            flow_id, current_frame, pkt_time = frame['flowID'], frame['data'], frame['time']
-            # Find the event of the current frame
-            event = findEvent(flow_id, current_frame, None, pkt_time, packt_count)
+            flowID, current_frame, pkt_time = frame['flowID'], frame['data'], frame['time']
+            event = findEvent(flowID, current_frame, None, pkt_time, pkt_count)
             if event is not None:
-                # If found event add it to log file
                 with open('FrameToEvent.txt', 'a') as f:
                     f.write('%s=%s' % (current_frame, event))
                     f.write('\n')
-                events_timestamp.append(pkt_time) # Add packet timestamp
-                event_sequence += f'{event}' # Add event to sequence
-                packt_count += 1
+                events_time.append(pkt_time)
+                seq += f'{event}'
+                pkt_count += 1
 
-    events_timestamp.append(F[-1]['time']) #Append timestamp of last frame
-    event_sequence += 'End'
-    # Extract the lookahead pairs from the sequence
-    lookahead_pairs = extractLookaheadPairs(event_sequence, n)
+    events_time.append(F[-1]['time'])
+    seq += 'End'
+    lookahead_pairs = extractLookaheadPairs(seq, n)
 
-    Dlookahead.update(lookahead_pairs) #Update with extracted pairs
-    events = event_sequence.split('->*') #Split each event of the sequence
+    Dlookahead.update(lookahead_pairs)
+    events = seq.split('->*')
 
-    # Calculate delays between consecutive events
-    event_index = 1
-    while event_index < packt_count:
-        delay = events_timestamp[event_index] - events_timestamp[event_index - 1]
-        event_transition_key = f'{events[event_index - 1]}{events[event_index]}'
-        # Update the delay dict with max delay for transition
-        if event_transition_key not in Ddelay:
-            Ddelay[event_transition_key] = delay
+    i = 1
+    while i < pkt_count:
+        delay = events_time[i] - events_time[i - 1]
+        str = f'{events[i - 1]}{events[i]}'
+        if str not in Ddelay:
+            Ddelay[str] = delay
         else:
-            Ddelay[event_transition_key] = max(delay, Ddelay[event_transition_key])
-        event_index += 1
+            Ddelay[str] = max(delay, Ddelay[str])
+        i += 1
 
     export_dict_to_file(Dlookahead, "Dlookahead.txt")
     export_dict_to_file(Ddelay, "Ddelay.txt")
 
-    return Dlookahead, Ddelay, packt_count
+    return Dlookahead, Ddelay, pkt_count
+
+
+def export_dict_to_file(dictionary, filename):
+    with open(filename, "w") as file:
+        for key, value in dictionary.items():
+            file.write(f"{key}={value}\n")
 
 
 def detection_phase(Dlookahead, Ddelay, n, t, packets, pcap_name):
-    """
-        Detects anomalies in packet delays by comparing actual event timings
-        with expected delays stored in `Ddelay`.
-
-        Ddelay (dict): maximum allowable delays for event transitions.
-        packets (list): A list of packets, each packet contains flowID, data, and time information.
-    """
-
-    event_sequence = ''
-    detected_events = []
+    seq = ''
+    events = []
     events_time = []
-    current_event_index = 0
+    i = 0
+    index = 0
     delay_counter = 0
-
-    for _packet in packets:
-        frame_data = _packet['data']  # frame content
-        # Map the frame to an event
-        event = findEvent(_packet['flowID'], frame_data, None, _packet['time'], 0)  # translateToEvent in pseudocode
+    # Assuming `packets` is a continuously updating list of packets
+    for packet in packets:
+        frame = packet['data']  # Assuming packet['data'] is the frame content
+        event = findEvent(packet['flowID'], frame, None, packet['time'], 0)  # translateToEvent in pseudocode
         if event:
-            current_event_index += 1
-            event_sequence += f'{event}' #Add event to sequence
-            events_time.append(_packet['time']) #timestamp of event
-            detected_events.append(event)
-            findEventTiming(_packet['flowID'], event, _packet['time'])  # Update event timing
+            index = index + 1
+            seq += f'{event}'
+            events_time.append(packet['time'])
+            events.append(event)
+            findEventTiming(packet['flowID'], event, packet['time'])  # Update event timing
+    newevents = seq.split('->*')
 
-    # Split event sequence (individual events)
-    new_events = event_sequence.split('->*')
+    if (len(newevents) > 1):
+        len_events = len(newevents)
+        for i in range(1, len_events - 1):
+            twoevent = f'{newevents[i - 1]}{newevents[i]}'
 
-    # Check for delays if there are at least 2 events
-    if len(new_events) > 1:
-        total_events = len(new_events)
-        for event_index in range(1, total_events - 1):
-            # Create key for transition between two consecutive events
-            event_transition_key = f'{new_events[event_index - 1]}{new_events[event_index]}'
-
-            write_to_file("DelaysDetect", event_transition_key, 'a')
-
-            # Check if the transition exists in the delay dict
-            if event_transition_key in Ddelay:
-                max_delay = Ddelay[event_transition_key] # Check the last event's maximum delay
-                if max_delay != 0:
-                # Check time difference from the last event timing (2 events)
-                    actual_delay = events_time[-1] - events_time[-2]
-                    if actual_delay  > max_delay:
-                        write_to_file(f'DelaysDetect_{pcap_name}', f'Attack: Delayyyyy", {event_transition_key}, " - {max}: ", {max_delay},"<", {actual_delay}', 'a')
+            write_to_file("DelaysDetect", twoevent, 'a')
+            if twoevent in Ddelay:
+                max_delay = Ddelay[twoevent]  # Check the last event's maximum delay
+                if (max_delay != 0):
+                    # Check time difference from the last event timing
+                    last_event_time = events_time[-1] - events_time[-2]
+                    if last_event_time > max_delay:
+                        write_to_file(f'DelaysDetect_{pcap_name}',
+                                      f'Attack: Delayyyyy", {twoevent}, " - {max}: ", {max_delay},"<", {last_event_time}',
+                                      'a')
+                        # print("Attack: Delayyyyy", twoevent, " - max: ", max_delay,"<", last_event_time)
                         delay_counter += 1
-    write_to_file(f'DelaysDetect_{pcap_name}', f'Found {delay_counter} delays' ,'a')
+                        # return True
+    write_to_file(f'DelaysDetect_{pcap_name}', f'Found {delay_counter} delays', 'a')
+    # print(f'Found {delay_counter} delays')
+    # return False
+
+
+def write_to_file(file_name, text_to_append, mode):
+    try:
+        with open(file_name, mode) as file:  # 'a' mode creates the file if it doesn't exist and appends text
+            file.write(text_to_append + '\n')  # Add a newline after the text
+    except Exception as e:
+        print(f"An error occurred: {e}")
 
 
 def detection_phase_mismatch(Dlookahead, Ddelay, n, t, packets, pcap_name):
-    """
-       Detects anomalies in sequences by analyzing mismatched lookahead pairs
-       and delay violations in packet sequences.
+    global seq_de, detect_count
+    events = []
+    i = 0
 
-       Args:
-           Dlookahead (dict): Dictionary of valid lookahead pairs.
-           Ddelay (dict): Dictionary of maximum allowable delays for event transitions.
-           n (int): Lookahead window size.
-           t (float): Threshold for mismatch ratio to classify a sequence as anomalous.
-           packets (list): List of packets, where each packet contains flowID, data, and time.
-           pcap_name (str): Name of the pcap file used for logging detections.
-    """
-
-    global seq_de, detect_count, packet
-    detected_events = []
-    timeout_counter = 0
-
-    # Build event sequence for each packet
     for packet in packets:
-        frame_data = packet['data']
-        #Map frame to event
-        event = findEvent(packet['flowID'], frame_data, None, packet['time'], 0)
+        frame = packet['data']
+        event = findEvent(packet['flowID'], frame, None, packet['time'], 0)
         if event:
-            seq_de += f'{event}' #Add event to global sequence
-            detected_events.append(event)
-            # Update event timing (used for delay violation checks)
+            seq_de += f'{event}'
+            events.append(event)
             findEventTiming(packet['flowID'], event, packet['time'])
 
-    if not detected_events:
+    if not events:
         return
 
-    # Check for delay violations
-    _last_event = detected_events[-1] # Last detected event
-    max_delay = max(Ddelay.get(_last_event, {'*': 0}).values()) # Max delay for last event
-    last_event_time = event_timings.get(packet['flowID'], [-1, None])[-1] # Last event's timing
-
+    last_event = events[-1]
+    max_delay = max(Ddelay.get(last_event, {'*': 0}).values())
+    last_event_time = event_timings.get(packet['flowID'], [-1, None])[-1]
 
     if last_event_time and (time.time() - last_event_time) > max_delay:
-        # Append timeout marker to sequence and log the delay
-        seq_de += f' → TO{timeout_counter} → *'
-        write_to_file(f'DetectMissmatch_{pcap_name}', f'Delayyyyy - {_last_event}', 'a')
-        timeout_counter += 1
+        seq_de += f' → TO{i} → *'
+        write_to_file(f'DetectMissmatch_{pcap_name}', f'Delayyyyy - {last_event}', 'a')
+        i += 1
 
-    # Detect mismatched lookahead pairs
     mismatch = 0
-    if len(detected_events) > n:
-        # Extract lookahead pairs from the sequence
-        _lookahead_pairs = extractLookaheadPairs(seq_de, n)
-        for pair in _lookahead_pairs:
+    if len(events) > n:
+        lookahead_pairs = extractLookaheadPairs(seq_de, n)
+        for pair in lookahead_pairs:
             if pair not in Dlookahead:
                 mismatch += 1
-                write_to_file(f'DetectMissmatch_{pcap_name}', "added1to_mismatch", 'a')
+                write_to_file(f'DetectMissmatch_{pcap_name}', "added1tomismatch", 'a')
 
-    # Calculate mismatch ratio
-    mismatch_ratio = mismatch / (n * (len(detected_events) - (n + 1) / 2))
-
-    # Log whether the sequence is anomalous or normal based on the mismatch ratio
+    mismatch_ratio = mismatch / (n * (len(events) - (n + 1) / 2))
     if mismatch_ratio > t:
         write_to_file(f'DetectMissmatch_{pcap_name}', "Sequence is anomalous", 'a')
         detect_count += 1
-    elif mismatch_ratio < t and detected_events[-1] == '->Goaway->*':
+    elif mismatch_ratio < t and events[-1] == '->Goaway->*':
+
         write_to_file(f'DetectMissmatch_{pcap_name}', "Sequence is normal", 'a')
+
+
+
+def import_dict_from_file(filename):
+    dictionary = {}
+    with open(filename, 'r') as file:
+        for line in file:
+            key, value = line.strip().split('=')
+            key = key.strip()
+            value = value.strip()
+            try:
+                # Attempt to evaluate value as a Python expression
+                # This will allow handling lists or other structures if they are in valid syntax
+                value = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                # Fall back to float or int if eval fails, treating value as simple number
+                value = float(value) if '.' in value else int(value)
+            dictionary[key] = value
+    return dictionary
 
 
 # Find the timing of event occurrences
@@ -289,23 +272,21 @@ def findEventTiming(flowID, event, pkt_time):
 
 
 def findEvent(flowID, current_frame, event, pkt_time, pkt_count):
-    """  Determines the event type from a given packet's data and flow ID.  """
     global last_event, event_timings, SERVER_PORT
 
     if flowID not in last_event:
         last_event[flowID] = ''
 
-    # Check if current_frame(frame data) is None
+    # Check if current_frame is None
     if current_frame is None:
         print("Error: current_frame is None. Skipping this packet.")
         return None
-
+    lenP = len(current_frame)
     # Check if the frame length is less than the minimum HTTP/2 header size
     if len(current_frame) < 9:
         print(f"Error: Frame length {len(current_frame)} is too short for a valid HTTP/2 frame for packet {pkt_count}.")
         return None
 
-    # Parse flow ID to extract source and destination
     try:
         src_part, dst_part = flowID.split('->')
         # print(f' {src_part}  {dst_part} ')
@@ -315,20 +296,19 @@ def findEvent(flowID, current_frame, event, pkt_time, pkt_count):
         print(f"Error parsing flowID: {flowID}, error: {ve}")
         return None  # Handle the error appropriately, possibly by skipping this frame
 
-
     if src_port == SERVER_PORT:
         flowID = dst_part  # If the source port is the server port, consider the destination part
     else:
         flowID = src_part  # Otherwise, use the source part
 
-    # Update timing for event
-    if event:
+    if event is not None:
         findEventTiming(flowID, event, pkt_time)
         return event
 
     # Begin processing the frame to determine the type of event
     event = ''
     do_nothing = 0
+    # print(f' current_frame: {current_frame}')
 
     # Check if current_frame has enough data to parse as an HTTP/2 frame
     if len(current_frame) < 9:  # HTTP/2 frame header is 9 bytes
@@ -389,7 +369,7 @@ def findEvent(flowID, current_frame, event, pkt_time, pkt_count):
                 print("Warning: H2SettingsFrame layer not found in current_frame.")
             event += '*'
     elif current_frame_type == 8:  # Window_Update Frame
-        if hasattr(current_frame["1"], 'win_size_incr') and current_frame["1"].win_size_incr == 0:
+        if hasattr(current_frame[1], 'win_size_incr') and current_frame[1].win_size_incr == 0:
             event = '->win_size_incr0->*'
         else:
             event = '->win_size_incr!0->*'
@@ -404,29 +384,20 @@ def findEvent(flowID, current_frame, event, pkt_time, pkt_count):
         findEventTiming(flowID, event, pkt_time)
         return event
     elif event == '' and flowID in last_event and last_event[flowID] == '->Data_frame_!ES->*' and do_nothing == 0:
-        findEventTiming(flowID, last_event[flowID], pkt_time)  # This line was corrected to call the findEventTiming function properly
+        findEventTiming(flowID, last_event[flowID],
+                        pkt_time)  # This line was corrected to call the findEventTiming function properly
         return last_event[flowID]
 
 
-
 def findEventSequencesPerFlow():
-    """
-    Extracts and stores unique event sequences for each flow based on their timings.
-
-    Updates:
-        - flow_dict: with event sequences for each flow
-        - unique_event_sequences: with any new sequences found.
-
-    """
     global flow_dict, unique_event_sequences, event_timings, flow_dict_with_TO
-
     for flowID in event_timings:
         flow_dict[flowID] = ''
-        index = 1
+        i = 1
         for event in event_timings[flowID]:
-            if index % 2 != 0:
+            if i % 2 != 0:
                 flow_dict[flowID] += event  # To store only the event names and not the timings
-            index += 1
+            i += 1
 
     for flowID in flow_dict:
         if flow_dict[flowID] not in unique_event_sequences:
@@ -434,188 +405,112 @@ def findEventSequencesPerFlow():
 
 
 def calculateAvgDelayBetweenEvents():
-    """
-        Calculates the average delay between pairs of consecutive events for each flow ID
-        in the `event_timings` dictionary and updates the `avg_delay_between_events` dictionary.
-
-        Iterates through the events and their associated timings in the
-        `event_timings` global dictionary. It computes the time difference between
-        consecutive events and stores the maximum delay for each pair in the
-        `avg_delay_between_events` global dictionary.
-
-        Global Variables:
-            event_timings (dict): Containing flow IDs as keys and lists
-                of alternating events and their timings as values.
-            avg_delay_between_events (dict): keys are concatenated
-                pairs of events (as strings) and values are the maximum delay (float)
-                between those events.
-        """
     global event_timings, avg_delay_between_events
-
-    for flow_id in event_timings:
-        event_index = 0
-        while event_index + 3 < len(event_timings[flow_id]):
-            # Extract the first event and its timing
-            first_event = event_timings[flow_id][event_index]
-            first_event_timing = event_timings[flow_id][event_index + 1]
-
-            # Extract the second event and its timing
-            second_event = event_timings[flow_id][event_index + 2]
-            second_event_timing = event_timings[flow_id][event_index + 3]
-
-            # Create a combined key for the two events
+    for item in event_timings:
+        i = 0
+        while i + 3 < len(event_timings[item]):
+            first_event = event_timings[item][i]
+            first_event_timing = event_timings[item][i + 1]
+            second_event = event_timings[item][i + 2]
+            second_event_timing = event_timings[item][i + 3]
             combined_events = first_event + second_event
-
-            # Update the avg_delay_between_events dictionary with the maximum delay for the pair
             if combined_events in avg_delay_between_events:
-                avg_delay_between_events[combined_events] = max(second_event_timing - first_event_timing, avg_delay_between_events[combined_events])
+                avg_delay_between_events[combined_events] = max(second_event_timing - first_event_timing,
+                                                                avg_delay_between_events[combined_events])
             else:
                 avg_delay_between_events[combined_events] = second_event_timing - first_event_timing
-
-            # Move to the next pair of events
-            event_index += 2
+            i += 2
 
 
-def extractFrame(flowID, index, _packet, packet_count):
-    """
-        Extracts HTTP/2 frames from a packet, handles incomplete frames across packets, 
-        and processes completed frames by calling the `findEvent` function.
-
-        Parameters:
-            flowID (str): The flow identifier for the packet.
-            index (int): The current offset within the packet data.
-            _packet (dict): The packet data containing the raw frame information.
-            packet_count (int): The count of the packet being processed.
-
-        Global Variables:
-            incomplete_frame (dict): Stores incomplete frames for each flow ID.
-
-        """
+def extractFrame(flowID, index, pkt, pkt_count):
     global incomplete_frame
-
-    if _packet['data'] is None:
+    if pkt['data'] is None:
         print("Error: current_frame is None. Skipping this packet.")
         return None
-
-    packt_length = len(_packet['data']) #length of packet data
+    pkt_length = len(pkt['data'])
 
     if flowID in incomplete_frame:
-        if incomplete_frame[flowID] != '':  # If partial content of the current flowID is already received in the previous frame
+        if incomplete_frame[
+            flowID] != '':  # If partial content of the current flowID is already received in the previous frame
             if len(incomplete_frame[flowID]) >= 3:  # Since the length is present in the first 3 octet of HTTP2 header
                 complete_frame_len = int(incomplete_frame[flowID][index:index + 3].hex(), 16)
             else:
                 # If the first 3 octets of HTTP2 header is not present, read the length octets from incomplete_frame[flowID] and remaining length octets received in current packet.
-                extract_len_bytes = incomplete_frame[flowID][index:] + _packet[Raw].load[:3 - len(incomplete_frame[flowID])]
+                extract_len_bytes = incomplete_frame[flowID][index:] + pkt[Raw].load[:3 - len(incomplete_frame[flowID])]
                 complete_frame_len = int(extract_len_bytes.hex(), 16)
             incomplete_frame_len = len(incomplete_frame[flowID]) - 9  # This can be negative, don't worry.
             remaining_frame_len = complete_frame_len - incomplete_frame_len  # Length of the remaining content of the frame.
-
-            if remaining_frame_len <= packt_length:  # If whole remaining content is present in the current packet
-                remaining_frame = _packet[Raw].load[index:remaining_frame_len]
+            if remaining_frame_len <= pkt_length:  # If whole remaining content is present in the current packet
+                remaining_frame = pkt[Raw].load[index:remaining_frame_len]
                 complete_frame = incomplete_frame[flowID] + remaining_frame
                 print("before calling complete")
-                findEvent(flowID, complete_frame, None, _packet.time, packet_count)
+                findEvent(flowID, complete_frame, None, pkt.time, pkt_count)
                 print("after calling complete")
                 index = remaining_frame_len
                 incomplete_frame[flowID] = ''
             else:
                 # If the remaining content is larger than the current packet, store the content received in current packet and then combine it with the contents in upcoming packets unless it becomes a complete frame.
-                remaining_frame = _packet['data'][index:packt_length]
+                remaining_frame = pkt['data'][index:pkt_length]
                 incomplete_frame[flowID] += remaining_frame
-                index = packt_length
-
-    # Process the packet data to extract complete HTTP/2 frames
-    while index < packt_length:  # Traverse through the whole packet in order to find the HTTP2 frames present into the packet.
-        current_frame_len = int(_packet['data'][index:index + 3].hex(), 16)
-
-        if index + current_frame_len + 9 <= packt_length:  # If one complete frame is present into the packet.
-            current_frame = _packet['data'][index:index + current_frame_len + 9]
-            findEvent(flowID, current_frame, None, _packet.time, packet_count)
+                index = pkt_length
+    while index < pkt_length:  # Traverse through the whole packet in order to find the HTTP2 frames present into the packet.
+        current_frame_len = int(pkt['data'][index:index + 3].hex(), 16)
+        if index + current_frame_len + 9 <= pkt_length:  # If one complete frame is present into the packet.
+            current_frame = pkt['data'][index:index + current_frame_len + 9]
+            findEvent(flowID, current_frame, None, pkt.time, pkt_count)
         else:  # If only a part of the frame is present into the packet, store the remaining content into the incomplete frame[flowID].
-            incomplete_frame[flowID] = _packet['data'][index:packt_length]
-
+            incomplete_frame[flowID] = pkt['data'][index:pkt_length]
         index += current_frame_len + 9
 
 
 def printEvents(print_options):
-    """
-        A function to save various datasets to text files based on the given print option.
-    Args:
-        print_options: Specifies what type of data to print:
-             'avg_delay' - Prints average delays between events.
-             'all' - Prints all datasets, including unique sequences, event timings, and flow dictionary.
-
-    """
     global flow_dict, event_timings, avg_delay_between_events, unique_event_sequences, lookahead_pairs, pair_count
-
     if print_options == 'avg_delay':
         with open('avg_delay_dataset_new.txt', 'w') as f:
             for item in avg_delay_between_events:
-                # Write each event pair and its average delay
                 f.write('%s=%s' % (item, avg_delay_between_events[item]))
                 f.write('\n')
     elif print_options == 'all':
-        # Save the unique event sequences to a file
         with open('unique_sequences_new.txt', 'w') as f:
             for item in unique_event_sequences:
                 f.write(item)
                 f.write('\n')
-
-        # Save the event timings dataset to a file
         with open('event_timings_new.txt', 'w') as f:
             for item in event_timings:
                 f.write('%s %s' % (item, event_timings[item]))
                 f.write('\n')
-
-        # Save the flow dictionary dataset to a file
         with open('flowdict_new.txt', 'w') as f:
             for item in flow_dict:
                 f.write('%s %s' % (item, flow_dict[item]))
                 f.write('\n')
 
 
-def readPackets(_pcap_file):
-    """
-     a pcap file, extracts packets that contain TCP data, and filters out packets
-    associated with HTTP/1.1 clients. It also loads a pre-existing average delay dataset from a file if available.
-    """
+def readPackets(pcap_file):
     global flow_dict, event_timings, delay_dictionary, incomplete_frame
-
-    # List to track HTTP/1.1 clients and packets
-    http11_clients = []  # To store flow IDs of clients using HTTP/1.1
-    packets = []  # To store packet information
+    http11_clients = []
+    packets = []
 
     # Load average delay dataset if it exists
     if os.path.exists("avg_delay_dataset_new.txt"):
         with open("avg_delay_dataset_new.txt", 'r') as f:
             lines = f.readlines()
-            # Parse each line to extract event pair and time difference
             for line in lines:
                 event, time_diff = line.strip().split('=')
                 delay_dictionary[event] = float(time_diff)
 
     # Ensure pcap_file is a string path to a pcap file
-    if not isinstance(_pcap_file, str):
-        print(f"Expected a file path string, got {type(_pcap_file)} instead")
-        return []  # Return an empty list if the input is invalid
+    if not isinstance(pcap_file, str):
+        print(f"Expected a file path string, got {type(pcap_file)} instead")
+        return []
 
-    # Read the pcap file and process each packet
-    with PcapReader(_pcap_file) as pcap_reader:
+    with PcapReader(pcap_file) as pcap_reader:
         for pkt in pcap_reader:
-            # Check if the packet has IP and TCP layers
             if pkt.haslayer(IP) and pkt.haslayer(TCP):
-                # Construct a unique flow ID based on source and destination IPs and ports
                 flowID = f"{pkt[IP].src}:{pkt[TCP].sport}->{pkt[IP].dst}:{pkt[TCP].dport}"
-
-                # Extract the packet payload, if available
                 data = bytes(pkt[Raw].load) if pkt.haslayer(Raw) else None
-
-                pkt_time = pkt.time  # timestamp of the packet
-
+                pkt_time = pkt.time
                 packet_dict = {'flowID': flowID, 'data': data, 'time': pkt_time}
                 packets.append(packet_dict)
-
-                # Check if the packet is from a client using HTTP/1.1
                 if pkt[TCP].sport == 80 and 'HTTP/1.1' in str(data):
                     http11_clients.append(flowID)
 
@@ -624,35 +519,16 @@ def readPackets(_pcap_file):
     return filtered_packets
 
 
-def import_dict_from_file(filename):
-
-    """
-    reads a file containing key-value pairs separated by '=' and imports them into a dictionary.
-    The value is evaluated as a Python literal (if possible) to handle lists, booleans, or other Python data structures.
-    If evaluation fails, the value is converted to a number (float or int) based on the format of the value.
-    """
-    dictionary = {}
-
-    with open(filename, 'r') as file:
-        for line in file:
-            key, value = line.strip().split('=')  # Split the line into key and value by the '=' delimiter
-            key = key.strip()  # Remove any leading/trailing whitespace from the key
-            value = value.strip()  # Remove any leading/trailing whitespace from the value
-            try:
-                # Attempt to evaluate value as a Python expression
-                # This will allow handling lists or other structures if they are in valid syntax
-                value = ast.literal_eval(value)
-
-            except (ValueError, SyntaxError):
-                # Fall back to float or int if eval fails, treating value as simple number
-                value = float(value) if '.' in value else int(value)
-            dictionary[key] = value
-    return dictionary
-
 def copy_and_rename_files_in_folder(folder_path, new_name_prefix):
     """
     Copies and renames all files in the specified folder with a given prefix.
 
+    Args:
+        folder_path (str): Path to the folder containing files to copy and rename.
+        new_name_prefix (str): Prefix for the new file names.
+
+    Returns:
+        None
     """
     try:
         # Check if the folder exists
@@ -663,14 +539,9 @@ def copy_and_rename_files_in_folder(folder_path, new_name_prefix):
         # Get the list of files in the folder
         files = os.listdir(folder_path)
 
-        # Get the project's folder path
-        project_folder = os.getcwd() #Get the current working directory
-
-
         # Create a destination folder for the copied files
-        destination_folder = os.path.join(project_folder, f'{new_name_prefix}_streams')
+        destination_folder = os.path.join(f'/home/dvir/PycharmProjects/FinalProj/{new_name_prefix}_streams')
         os.makedirs(destination_folder, exist_ok=True)
-
         index = 1
         # Iterate through the files and copy/rename them
         for index, file_name in enumerate(files):
@@ -697,14 +568,13 @@ def copy_and_rename_files_in_folder(folder_path, new_name_prefix):
 
 
 def split_streams(input_pcap):
-    project_folder = os.getcwd()
     # Output directory
-    output_dir =  f'split_streams {input_pcap}'
-    folder_dest = os.path.join(project_folder, f'{input_pcap}_streams')
-
+    output_dir = f'split_streams {input_pcap}'
+    folder_dest = f'/home/dvir/PycharmProjects/FinalProj/{input_pcap}_streams'
     if os.path.isdir(output_dir) or os.path.isdir(folder_dest):
         if os.path.isdir(folder_dest):
-            return len([f for f in os.listdir(folder_dest) if os.path.isfile(os.path.join(folder_dest, f))]), folder_dest
+            return len(
+                [f for f in os.listdir(folder_dest) if os.path.isfile(os.path.join(folder_dest, f))]), folder_dest
         else:
             return copy_and_rename_files_in_folder(folder_dest, input_pcap)
 
@@ -736,114 +606,182 @@ def split_streams(input_pcap):
             except subprocess.CalledProcessError as e:
                 print(f"Error while extracting stream ID {stream_id}: {e}")
 
-    return copy_and_rename_files_in_folder(folder_dest, input_pcap)
+    return copy_and_rename_files_in_folder(f'/home/dvir/PycharmProjects/FinalProj/{output_dir}', input_pcap)
 
 
-def export_dict_to_file(dictionary, filename):
-    with open(filename, "w") as file:
-        for key, value in dictionary.items():
-            file.write(f"{key}={value}\n")
-
-
-def write_to_file(file_name, text_to_append, mode):
-    try:
-        with open(file_name, mode) as file:  # 'a' mode creates the file if it doesn't exist and appends text
-            file.write(text_to_append + '\n')  # Add a newline after the text
-    except Exception as e:
-        print(f"An error occurred: {e}")
-
-
-def main_run(input_pcap, function_type=1, threshold=0.0):
-    """
-        Runs different phases of packet analysis based on the specified function type.
-
-        Args:
-            input_pcap (str): Path to the input PCAP file.
-            function_type (int): Determines the phase of the pipeline to run (1: Learning, 2: Detection, 3: Mismatch Detection).
-            threshold (float): A threshold value used in detection and mismatch detection phases.
-
-        Returns:
-            None
-        """
-
+def main_run(input_pcap, func=1, t=0.0):
     global seq_de, detect_count
     Dlookahead = {}
     Ddelay = {}
-    total_packets = 0
+    sum_packet = 0
+    if func == 1:
+        count, dest_folder = split_streams(input_pcap)
 
-    # Learning phase (Function Type 1)
-    if function_type == 1:
-        # Split the streams and get the count and destination folder
-        stream_count, dest_folder = split_streams(input_pcap)
-
-        for stream_index  in range(1, stream_count + 1):
-            print(f"Open input_pcap{stream_index }.pcap")
-            packets = readPackets(f'{dest_folder}/input_pcap{stream_index }.pcap')
+        for i in range(1, count + 1):
+            print(f"Open input_pcap{i}.pcap")
+            packets = readPackets(f'{dest_folder}/input_pcap{i}.pcap')
             Dlookahead, Ddelay, packets_count = learning_phase(Dlookahead, Ddelay, packets, window_size)
 
-            total_packets += packets_count
-
-        print(f'Read {total_packets} packets')
-
+            sum_packet += packets_count
+        print(f'Read {sum_packet} packets')
         export_dict_to_file(Dlookahead, "Dlookahead.txt")
         export_dict_to_file(Ddelay, "Ddelay.txt")
-
-    # Detection phase (Function Type 2)
-    elif function_type == 2:
+    elif func == 2:
         seq_de = ""
-
-        # Clear any existing mismatch detection result file
-        if os.path.isfile(f'DetectMissmatch_{input_pcap}'):
+        if os.path.isfile(f'Detect_{input_pcap}'):
             write_to_file(f'DetectMissmatch_{input_pcap}', "", 'w')
-
-
-        # Import the data from the learning phase files
         Dlookahead = import_dict_from_file("Dlookahead.txt")
         Ddelay = import_dict_from_file("Ddelay.txt")
-
-        # Read packets from the input pcap file for detection
+        # for i in range(1, count + 1):
+        #     print(f"Open dataset{i}.pcap")
         packets = readPackets(input_pcap)
-        # Run the detection phase
-        detection_phase(Dlookahead, Ddelay, window_size, threshold, packets, input_pcap)
+        detection_phase(Dlookahead, Ddelay, window_size, t, packets, input_pcap)
 
-    # Mismatch detection phase (Function Type 3)
-    elif function_type == 3:
-        # Clear any existing mismatch detection result file
+    elif func == 3:
         if os.path.isfile(f'DetectMissmatch_{input_pcap}'):
             write_to_file(f'DetectMissmatch_{input_pcap}', "", 'w')
-
-        # Split the streams and get the count and destination folder
-        stream_count, dest_folder = split_streams(input_pcap)
+        count, dest_folder = split_streams(input_pcap)
         seq_de = ""
         detect_count = 0
-
         Dlookahead = import_dict_from_file("Dlookahead.txt")
         Ddelay = import_dict_from_file("Ddelay.txt")
-
-        # Process each stream and detect mismatches
-        for stream_index  in range(1, stream_count + 1):
-            print(f"Open {input_pcap}{stream_index }.pcap")
-            packets = readPackets(f'{dest_folder}/{input_pcap}{stream_index }.pcap')
-            detection_phase_mismatch(Dlookahead, Ddelay, window_size, threshold, packets, input_pcap)
+        for i in range(1, count + 1):
+            print(f"Open {input_pcap}{i}.pcap")
+            packets = readPackets(f'{dest_folder}/{input_pcap}{i}.pcap')
+            count = detection_phase_mismatch(Dlookahead, Ddelay, window_size, t, packets, input_pcap)
 
         write_to_file(f'DetectMissmatch_{input_pcap}', f'detect {detect_count} anomalous', 'a')
 
 
 
+def load_results():
+    """Load the actual results from files generated by the learning and detection phases."""
+    Ddelay = {}
+    Dlookahead = {}
+    mismatches = []
+
+    # Load delays
+    if os.path.exists("Ddelay.txt"):
+        with open("Ddelay.txt", "r") as file:
+            for line in file:
+                key, value = line.strip().split("=")
+                Ddelay[key] = float(value)
+
+    # Load lookahead pairs
+    if os.path.exists("Dlookahead.txt"):
+        with open("Dlookahead.txt", "r") as file:
+            for line in file:
+                key, value = line.strip().split("=")
+                Dlookahead[key] = eval(value)
+
+    # Load mismatch logs
+    if os.path.exists("DetectMissmatch_Google-Chrome.pcap"):
+        with open("DetectMissmatch_Google-Chrome.pcap", "r") as file:
+            for line in file:
+                if "added1to_mismatch" in line:
+                    mismatches.append(1)
+
+    return Ddelay, Dlookahead, mismatches
+
+
+def plot_cdf(data, title, xlabel, ylabel, filename):
+    """Plot a CDF from the given data."""
+    data = np.sort(data)
+    y = np.arange(1, len(data) + 1) / len(data)
+
+    plt.figure()
+    plt.plot(data, y, marker=".", linestyle="none")
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_histogram(data, title, xlabel, ylabel, bins, filename):
+    """Plot a histogram for the given data."""
+    plt.figure()
+    plt.hist(data, bins=bins, color="blue", alpha=0.7)
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+
+def plot_comparative_lines(data_dict, title, xlabel, ylabel, filename):
+    """Plot comparative line plots from a dictionary of data."""
+    plt.figure()
+    for label, data in data_dict.items():
+        plt.plot(data["x"], data["y"], label=label, marker=data.get("marker", None))
+
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(filename)
+    plt.close()
+
+
+
+def create_plot():
+    # Load actual data
+    Ddelay, Dlookahead, mismatches = load_results()
+
+    # Prepare data for plotting
+    delays = list(Ddelay.values())
+    mismatch_counts = [sum(mismatches)]
+    time_series = list(range(1, len(mismatch_counts) + 1))
+
+    # Prepare lookahead metrics for comparison
+    lookahead_data = {
+        key: {
+            "x": list(range(len(value))),
+            "y": [len(v) for v in value],
+            "marker": "o",
+        }
+        for key, value in Dlookahead.items()
+    }
+
+    # Generate CDF for delays
+    plot_cdf(
+        delays,
+        title="CDF of Event Delays",
+        xlabel="Delay (ms)",
+        ylabel="Cumulative Probability",
+        filename="cdf_delays.png",
+    )
+
+    # Generate histogram for mismatches
+    plot_histogram(
+        mismatch_counts,
+        title="Histogram of Mismatches",
+        xlabel="Number of Mismatches",
+        ylabel="Frequency",
+        bins=8,
+        filename="histogram_mismatches.png",
+    )
+
+    # Generate comparative line plots for lookahead data
+    if lookahead_data:
+        plot_comparative_lines(
+            lookahead_data,
+            title="Comparative Lookahead Analysis",
+            xlabel="Time (s)",
+            ylabel="Lookahead Metric",
+            filename="lookahead_comparisons.png",
+        )
+
+    print("Plots generated and saved!")
+
+
 if __name__ == '__main__':
 
-    begin = time.time()
-    pcap_file = PCAP
     window_size = sys.argv[1] if len(sys.argv) > 1 else 2  # Default window size if not specified
-    # packets = readPackets(pcap_file)  # Ensure this function reads the pcap file and returns packet data
-
-    # open_datasets()
-
-    # Dlookahead = import_dict_from_file("Dlookahead.txt")
-    # Ddelay = import_dict_from_file("Ddelay.txt")
-
-    main_run('attack1.pcap', 3)
-    # # Check packets structure before passing to learning_phase
-    # print("Packets structure check:", packets[:5])  # Print the first few packets to check structure
-    # Dlookahead, Ddelay = learning_phase(packets, window_size)
-    end = time.time()
+    create_plot()
+    # begin = time.time()
+    # main_run('attack2.pcap', 3, 0.02)
+    # end = time.time()
