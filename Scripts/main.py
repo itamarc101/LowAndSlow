@@ -87,7 +87,7 @@ def main_run(input_pcap, function_type=1, threshold=0.0):
 if __name__ == '__main__':
 
     begin = time.time()
-    pcap_file = config.PCAP
+    # pcap_file = config.PCAP
     window_size = sys.argv[1] if len(sys.argv) > 1 else 2  # Default window size if not specified
     # packets = readPackets(pcap_file)  # Ensure this function reads the pcap file and returns packet data
 
