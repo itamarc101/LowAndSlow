@@ -33,7 +33,13 @@ The script has **3 main phases**:
    - Detects delay violations in new traffic based on learned delays.
 3. **Mismatch Detection Phase:**
    - Identifies mismatched event pairs and sequences in the traffic.
-     
+  
+   ![image](https://github.com/user-attachments/assets/ea4bdd36-cc02-4557-839e-5db5899639df)
+
+   ![detection](https://github.com/user-attachments/assets/fff96efb-3d3d-4790-bcc9-3f88224b8a81)
+
+   ![mismatch](https://github.com/user-attachments/assets/85f7c241-e3c6-431a-89d0-eb7e8766d7f5)
+
 
 ## **Files Generated**
 - `Dlookahead.txt`: Contains learned lookahead pairs for event prediction.
